@@ -39,3 +39,6 @@ kp-manager update-flash
 kp-manager --dry-run update-nas
 man kp-manager
 ```
+## Note
+
+For devices such as a phone, it is recommended to synchronize your desktop with the device using Syncthing.
