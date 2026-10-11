@@ -1,0 +1,333 @@
+.TH KP-MANAGER 1 "October 2026" "kp-manager 2.0.0" "User Commands"
+.SH NAME
+kp\-manager \- hardened backup and sync manager for KeePass (.kdbx) databases on a PC, USB flash drive, NAS and Google Drive
+.SH SYNOPSIS
+.B kp\-manager
+[\fIOPTIONS\fR]
+.I COMMAND
+[\fIARGUMENTS\fR]
+.SH DESCRIPTION
+.B kp\-manager
+keeps copies of one KeePass database (a \fI.kdbx\fR file) in four places: the \fBPC\fR, a
+\fBUSB flash drive\fR, a \fBNAS\fR share (CIFS/SMB) and \fBGoogle Drive\fR (through \fBrclone\fR).
+.PP
+The copy on the PC is the \fIcurrent version\fR and the source of every update. When a location is
+updated, the version that was there is first saved in that location's backups folder as
+.IR DATABASE _ YYYYMMDD _ HHMMSS . EXT
+(for example \fIDatabase_20261011_143000.kdbx\fR) and only then replaced.
+Nothing is ever overwritten without a verified copy of the old version.
+.PP
+.B kp\-manager
+never opens or decrypts the database. It copies, compares, checks and renames files only.
+.SH SAFETY GUARANTEES
+.TP
+.B One instance at a time
+Every command that writes takes an exclusive \fBflock\fR(1) lock on
+\fI~/.local/state/kp\-manager/kp\-manager.lock\fR. A second instance exits at once with status 75 instead of
+waiting, so two runs can never write to the database or sync at the same time.
+.TP
+.B SHA\-256 verification
+Every copy is verified three times: the source is hashed before the copy, the temporary file is hashed
+after it is written, and the final file is hashed again after it has been moved into place.
+Any mismatch aborts the operation. Google Drive provides no SHA\-256, so files there are downloaded
+and hashed locally rather than trusting MD5.
+.TP
+.B Atomic replacement
+A file is first written under a hidden temporary name next to its destination
+(\fI.NAME.kp\-tmp.PID\fR), verified, and only then renamed over the destination. An interrupted or failed
+copy therefore never leaves a half-written database; the old file stays intact.
+.TP
+.B Cleanup on exit
+A trap on EXIT, INT (Ctrl+C), TERM and HUP removes temporary files, unmounts a NAS or USB drive that
+\fBkp\-manager\fR mounted itself, removes its scratch directory and releases the lock, even after a crash
+or interruption. A share that was already mounted before the run is left mounted.
+.TP
+.B Sanity checks
+Before a database is copied, \fBkp\-manager\fR checks that it starts with the KeePass 2.x file signature,
+that it is not less than half the size of the copy it would replace, and that the copy on the target is
+not newer than the one on the PC. A failed check is a \fIsafety warning\fR: it stops the run unless you
+answer yes at the prompt or pass \fB\-\-force\fR. Without a terminal the run is refused.
+.TP
+.B Private files
+Files are created with mode 600. The config file must be owned by you and not writable by group or others;
+the NAS credentials file must not be accessible by others. Otherwise \fBkp\-manager\fR refuses to use it.
+.SH COMMANDS
+Locations are \fBpc\fR, \fBflash\fR, \fBnas\fR and \fBgdrive\fR. Aliases: \fBusb\fR and \fBstick\fR (flash);
+\fBgd\fR, \fBgoogle\fR (gdrive); \fBlocal\fR (pc).
+.TP
+\fBinit\fR
+Interactive setup wizard. Asks for every default path and setting (Enter keeps the value shown in
+brackets, \fB\-\fR clears it), offers to store the NAS login in a protected file
+(\fI~/.config/kp\-manager/nas.cred\fR, mode 600), saves the config file, and then tests the connections:
+PC database, backup folder, USB drives, NAS (a real mount and unmount) and the rclone remote.
+The wizard also starts by itself on the first run of any command when no config file exists.
+.TP
+\fBupdate\-flash\fR
+Scans for USB partitions, shows a numbered list and lets you choose one (\fBq\fR cancels). The partition
+is mounted if necessary. If the flash drive already has a database it is checked, backed up with a
+timestamp in the drive's backups folder, and then the PC database is copied over it with full
+verification. Afterwards the drive is unmounted again if \fBkp\-manager\fR mounted it.
+Encrypted (LUKS), swap and RAID members and system mount points are never offered.
+.TP
+\fBupdate\-nas\fR
+Mounts the share with \fBsudo mount \-t cifs\fR using your credentials file (or \fBNAS_USER\fR; the
+password is then asked by mount), backs up the NAS database with a timestamp, writes the PC database,
+verifies it, and cleanly unmounts. If the share is already mounted it is used and left mounted.
+Without \fBNAS_MOUNT\fR a temporary mount point is created and removed again.
+.TP
+\fBupdate\-gdrive\fR
+Same procedure through \fBrclone\fR. The old remote database is copied into the remote backups folder first
+(rotation is controlled by \fBKEEP_BACKUPS\fR), and every rclone call is retried with exponential
+back-off, which copes with Drive rate limits (HTTP 429, quota messages). The uploaded file is read back
+and its SHA\-256 compared with the source.
+.TP
+\fBupdate\-all\fR
+Runs flash, NAS and Google Drive one after another. A failure in one does not stop the others; the
+exit status is 1 if any failed.
+.TP
+\fBbackup\-pc\fR
+Copies the PC database into the PC backups folder as \fIDATABASE_YYYYMMDD_HHMMSS.EXT\fR.
+.TP
+\fBbackup\-flash\fR, \fBbackup\-nas\fR, \fBbackup\-gdrive\fR
+Copies the database that is \fIalready on that location\fR into that location's own backups folder.
+.TP
+\fBrestore\fR [\fIlocation\fR] [\fIname\fR]
+Rolls the PC database back. \fIlocation\fR defaults to \fBpc\fR. Without \fIname\fR you choose from a numbered
+list of timestamped backups, newest first. \fIname\fR can be a backup file name, \fBlatest\fR (the newest backup)
+or \fBcurrent\fR (the live database of flash, nas or gdrive). The selected file is checked and verified, and
+the current PC database is backed up first, so a restore can itself be undone.
+.TP
+\fBlist\fR \fIlocation\fR
+Prints the backups at a location, oldest first.
+.TP
+\fBdiff\fR \fIlocation\fR
+Compares checksum, size and modification time of the PC database and the one at the location.
+Exit status 0 = identical, 4 = different or missing.
+.TP
+\fBprune\fR \fIlocation\fR \fB\-\-keep\fR \fIN\fR
+Deletes all but the \fIN\fR newest backups at a location (after asking).
+.TP
+\fBconfig\fR [\fBshow\fR|\fBget\fR \fIKEY\fR|\fBset\fR \fIKEY\fR \fIVALUE\fR|\fBedit\fR|\fBpath\fR]
+Shows or changes single settings without running the wizard.
+.TP
+\fBinfo\fR
+Prints settings, file locations, the name the next backup would get and which programs are installed.
+.TP
+\fBcompletion\fR \fBbash\fR
+Prints a bash completion script: \fBsource <(kp\-manager completion bash)\fR.
+.TP
+\fBhelp\fR, \fBversion\fR
+Print the built-in help or the version.
+.SH OPTIONS
+Options may appear before or after the command. Single-letter flags can be combined (\fB\-nv\fR).
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Simulate every copy, move, delete and mount: the exact actions are printed (and logged), nothing is
+changed and no drive or share is mounted. Because nothing is mounted, a dry run cannot look inside a
+NAS or USB drive that is not mounted yet.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Print detailed steps, including every SHA\-256 value before the copy, of the temporary file and after the move.
+.TP
+\fB\-f\fR, \fB\-\-force\fR
+Bypass safety warnings: identical hashes (update anyway), a source that is not a KDBX file, a target
+that is much larger or newer. Use with care.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer routine questions with yes (delete old backups? replace the PC database?) and pick the USB drive
+automatically when exactly one is found. It does \fInot\fR override safety warnings; use \fB\-\-force\fR for that.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Display the formatted usage text.
+.TP
+\fB\-c\fR, \fB\-\-config\fR \fIFILE\fR
+Use another config file.
+.TP
+\fB\-\-db\fR \fIFILE\fR
+Use \fIFILE\fR as the PC database for this run (overrides \fBDB_PATH\fR).
+.TP
+\fB\-d\fR, \fB\-\-device\fR \fIDEV\fR
+Use this USB partition (for example \fI/dev/sdb1\fR) and skip the menu.
+.TP
+\fB\-\-usb\-path\fR \fIDIR\fR
+Treat \fIDIR\fR as the root of the flash drive. No menu, no mounting.
+.TP
+\fB\-\-no\-mount\fR
+Never mount or unmount anything; the NAS folder and the flash drive must already be available.
+.TP
+\fB\-k\fR, \fB\-\-keep\fR \fIN\fR
+Number of backups to keep (\fBprune\fR; also overrides \fBKEEP_BACKUPS\fR for automatic rotation).
+.TP
+\fB\-\-no\-color\fR
+No colors. Colors are also off when standard error is not a terminal or \fBNO_COLOR\fR is set.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print the version.
+.SH CONFIGURATION
+Settings live in
+.I ~/.config/kp\-manager/config.conf
+as \fIKEY="value"\fR lines; lines starting with # are comments. \fB~\fR and \fB$HOME\fR are expanded.
+Values must not contain double quotes or line breaks. The file is created with mode 600 by \fBinit\fR.
+The database has the same file name everywhere (the base name of \fBDB_PATH\fR). Folders on the flash drive,
+NAS and Drive are relative to the drive root, the share root or the rclone remote root and must not
+contain \fB..\fR.
+.TP
+\fBDB_PATH\fR (~/KeePass/Database.kdbx)
+The PC database: current version and source of every update.
+.TP
+\fBPC_BACKUP_DIR\fR (~/KeePass/Backups)
+Backups folder on the PC.
+.TP
+\fBUSB_DB_DIR\fR (KeePass), \fBUSB_BACKUP_DIR\fR (KeePass/Backups)
+Database and backups folders on the flash drive.
+.TP
+\fBNAS_ADDR\fR (//192.168.1.1/KeePass), \fBNAS_MOUNT\fR (/mnt/nas/KeePass)
+The CIFS share and where it is mounted. Empty \fBNAS_MOUNT\fR means a temporary mount point per run.
+.TP
+\fBNAS_USER\fR (nasuser)
+User name, used when there is no credentials file; the password is then asked by mount.
+.TP
+\fBNAS_CREDENTIALS\fR (empty)
+Credentials file with \fBusername=\fR and \fBpassword=\fR lines, mode 600 (written by \fBinit\fR). It is passed
+to mount as \fBcredentials=FILE\fR, so the password never appears on a command line.
+.TP
+\fBNAS_MOUNT_OPTS\fR (empty)
+Extra mount options, comma separated, for example \fBvers=3.0\fR. Mounts always use
+\fBuid\fR, \fBgid\fR, \fBfile_mode=0600\fR, \fBdir_mode=0700\fR, \fBnosuid\fR, \fBnodev\fR and \fBnoexec\fR.
+.TP
+\fBNAS_DB_DIR\fR (empty), \fBNAS_BACKUP_DIR\fR (Backups)
+Database and backups folders inside the share. Empty database folder = share root.
+.TP
+\fBGDRIVE_REMOTE\fR (gdrive)
+Name of the rclone remote that points to Google Drive.
+.TP
+\fBGDRIVE_DB_DIR\fR (KeePass), \fBGDRIVE_BACKUP_DIR\fR (KeePass/Backups)
+Database and backups folders on Google Drive.
+.TP
+\fBGDRIVE_RETRIES\fR (4)
+Attempts per rclone call, 1 to 10. The wait starts at 2 seconds and doubles each time.
+.TP
+\fBKEEP_BACKUPS\fR (0)
+After each successful update or backup keep only the newest N backups at that location (0 = keep all).
+Also the default for \fBprune \-\-keep\fR.
+.SH LOCATIONS IN DETAIL
+.SS USB flash drive
+Drives are found with \fBlsblk\fR: removable or hot-pluggable partitions that carry a file system.
+Mounting uses \fBudisksctl\fR (no root needed); without udisks2, \fBsudo mount\fR is used on
+\fI/mnt/kp\-manager\-usb\fR, where file systems that store Unix permissions (such as ext4) may end up owned
+by root. FAT, exFAT and NTFS are mounted with your uid and gid.
+.SS NAS
+Needs \fBcifs\-utils\fR (\fBmount.cifs\fR) and, unless you are root, \fBsudo\fR.
+.SS Google Drive
+Needs \fBrclone\fR with a remote of type \fBdrive\fR. Create it once with \fBrclone config\fR and name it as
+\fBGDRIVE_REMOTE\fR; the wizard tests it. rclone keeps and refreshes the login token itself.
+.SH FILES
+.TP
+.I ~/.config/kp\-manager/config.conf
+Settings (mode 600).
+.TP
+.I ~/.config/kp\-manager/nas.cred
+NAS login written by \fBinit\fR (mode 600).
+.TP
+.I ~/.local/state/kp\-manager/activity.log
+Every operation with a timestamp and a level (INFO, STEP, SUCCESS, WARN, ERROR, DRYRUN, DEBUG), including
+the SHA\-256 of every copy. Rotated to \fIactivity.log.1\fR at 1 MiB.
+.TP
+.I ~/.local/state/kp\-manager/kp\-manager.lock
+The lock file.
+.TP
+.I *_BACKUP_DIR/DATABASE_YYYYMMDD_HHMMSS.EXT
+Backups. If a name is already taken (two runs within one second) \fB_2\fR, \fB_3\fR, ... is appended.
+.SH ENVIRONMENT
+.TP
+.B KP_MANAGER_CONFIG
+Config file to use instead of the default.
+.TP
+.B KP_MANAGER_RETRY_DELAY
+First retry delay in seconds for rclone (default 2).
+.TP
+.B VISUAL, EDITOR
+Editor for \fBconfig edit\fR.
+.TP
+.B NO_COLOR
+Disable colors.
+.TP
+.B XDG_RUNTIME_DIR, TMPDIR
+Where temporary mount points and scratch files are created.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error occurred, or at least one location failed.
+.TP
+.B 2
+Wrong usage (unknown command, option or location).
+.TP
+.B 4
+\fBdiff\fR only: the databases differ, or the location has none.
+.TP
+.B 75
+Another \fBkp\-manager\fR is running (lock held).
+.TP
+.B 129, 130, 143
+Interrupted by HUP, INT (Ctrl+C) or TERM; cleanup has run.
+.SH EXAMPLES
+First-time setup, then a safety copy on the PC:
+.PP
+.RS
+.nf
+kp\-manager init
+kp\-manager backup\-pc
+.fi
+.RE
+.PP
+Update the flash drive (choose it from a numbered list), see what an NAS update would do, then do it:
+.PP
+.RS
+.nf
+kp\-manager update\-flash
+kp\-manager \-\-dry\-run update\-nas
+kp\-manager \-\-verbose update\-nas
+.fi
+.RE
+.PP
+Update everything and check that the NAS copy matches:
+.PP
+.RS
+.nf
+kp\-manager update\-all
+kp\-manager diff nas
+.fi
+.RE
+.PP
+Roll back: pick a PC backup from a list, or take the newest NAS backup:
+.PP
+.RS
+.nf
+kp\-manager restore
+kp\-manager restore nas latest
+.fi
+.RE
+.PP
+Keep only the 20 newest Google Drive backups:
+.PP
+.RS
+.nf
+kp\-manager prune gdrive \-\-keep 20
+.fi
+.RE
+.SH DEPENDENCIES
+\fBbash\fR 4.4 or newer and GNU coreutils, findutils and util\-linux (\fBsha256sum\fR, \fBflock\fR, \fBlsblk\fR,
+\fBmountpoint\fR). Checked at start\-up for the command being run: \fBrclone\fR for Google Drive,
+\fBmount.cifs\fR (package cifs\-utils) and \fBsudo\fR for the NAS, \fBlsblk\fR for the USB menu.
+A missing program is reported together with the package to install.
+.SH NOTES
+Save and close the database in KeePass before updating so that the file on disk is the version you mean to copy.
+.PP
+Checksums are of the encrypted file; a match means the copy is byte for byte the same file.
+.PP
+If a key file is part of your master key, \fBkp\-manager\fR does not copy it; keep it elsewhere on purpose.
+.SH SEE ALSO
+\fBrclone\fR(1), \fBflock\fR(1), \fBmount.cifs\fR(8), \fBudisksctl\fR(1), \fBlsblk\fR(8), \fBsha256sum\fR(1)

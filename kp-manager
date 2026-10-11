@@ -1,0 +1,1567 @@
+#!/usr/bin/env bash
+#
+# kp-manager - hardened backup and sync manager for KeePass (.kdbx) databases
+#              PC <-> USB flash drive, NAS (CIFS/SMB) and Google Drive (rclone)
+#
+# Guarantees: one instance at a time (flock), SHA-256 verified copies (before the
+# copy, on the temporary file, and again after it is moved into place), atomic
+# replacement, and a cleanup trap that unmounts and releases the lock on exit,
+# crash or Ctrl+C.
+#
+# Documentation: kp-manager --help   |   man kp-manager
+
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] \
+   || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
+  echo "kp-manager: bash 4.4 or newer is required" >&2
+  exit 1
+fi
+
+set -euo pipefail
+umask 077                         # everything we create is private to the user
+
+: "${HOME:?HOME is not set}"
+
+readonly PROG=kp-manager
+readonly VERSION=2.0.0
+readonly CONFIG_DIR=$HOME/.config/kp-manager
+readonly STATE_DIR=$HOME/.local/state/kp-manager
+readonly LOG_FILE=$STATE_DIR/activity.log
+readonly LOCK_FILE=$STATE_DIR/kp-manager.lock
+CONFIG_FILE=${KP_MANAGER_CONFIG:-$CONFIG_DIR/config.conf}
+RETRY_BASE_DELAY=${KP_MANAGER_RETRY_DELAY:-2}
+
+# ------------------------------------------------------------------ settings
+# One row per setting: KEY|default|description. This table is the single source
+# of truth for the config file, the wizard, `config show` and `info`.
+CONFIG_TABLE=(
+  "DB_PATH|~/KeePass/Database.kdbx|PC: the KeePass database (current version; source of every update)"
+  "PC_BACKUP_DIR|~/KeePass/Backups|PC: folder for timestamped backups"
+  "USB_DB_DIR|KeePass|Flash: folder on the drive (relative to its root) holding the database"
+  "USB_BACKUP_DIR|KeePass/Backups|Flash: backups folder (relative to the drive root)"
+  "NAS_ADDR|//192.168.1.1/KeePass|NAS: CIFS share, //host/share"
+  "NAS_MOUNT|/mnt/nas/KeePass|NAS: local mount point (empty = a temporary one is created per run)"
+  "NAS_USER|nasuser|NAS: user name (used when there is no credentials file; mount then asks for the password)"
+  "NAS_CREDENTIALS||NAS: credentials file with username=/password= lines; must be mode 600"
+  "NAS_MOUNT_OPTS||NAS: extra mount options, comma separated (for example vers=3.0)"
+  "NAS_DB_DIR||NAS: folder inside the share holding the database (empty = share root)"
+  "NAS_BACKUP_DIR|Backups|NAS: backups folder inside the share"
+  "GDRIVE_REMOTE|gdrive|Google Drive: name of the rclone remote"
+  "GDRIVE_DB_DIR|KeePass|Google Drive: folder holding the database"
+  "GDRIVE_BACKUP_DIR|KeePass/Backups|Google Drive: backups folder"
+  "GDRIVE_RETRIES|4|Google Drive: attempts per rclone call (exponential back-off, copes with rate limits)"
+  "KEEP_BACKUPS|0|Keep only the newest N backups per location after each successful run (0 = keep all)"
+)
+
+declare -A CFG DEF DESC
+CFG_KEYS=()
+for _row in "${CONFIG_TABLE[@]}"; do
+  IFS='|' read -r _k _d _desc <<<"$_row"
+  CFG_KEYS+=("$_k"); DEF[$_k]=$_d; CFG[$_k]=$_d; DESC[$_k]=$_desc
+done
+unset _row _k _d _desc
+
+# ------------------------------------------------------------- global state
+DRY_RUN=0 VERBOSE=0 FORCE=0 ASSUME_YES=0 NO_MOUNT=0 COLOR=auto
+OPT_DB= OPT_DEVICE= OPT_USB_PATH= OPT_KEEP=
+ERR_REPORTED=0 LOCK_HELD=0 TMP_DIR=
+CLEANUP_FILES=()
+PC_DB= PC_BACKUP_DIR= DB_FILE= DB_STEM= DB_SUFFIX= TS=
+T_LOC= T_DB= T_DBDIR= T_BKDIR=
+T_MOUNTED_NAS= T_MOUNTED_NAS_TEMP=0
+T_MOUNTED_USB= T_MOUNTED_USB_MODE= T_MOUNTED_USB_PATH=
+USB_DEV=() USB_DESC=() USB_MNT=()
+USB_SEL_DEV= USB_SEL_MNT=
+BACKUP_MADE=
+NEEDS=()
+RCLONE_FLAGS=(--retries 3 --low-level-retries 10)
+CORE_TOOLS=(sha256sum flock stat cp mv rm rmdir mkdir mktemp find sort date head cut od tr sync sleep id dirname basename)
+C_RED= C_GRN= C_YEL= C_BLU= C_DIM= C_BLD= C_OFF=
+
+# ----------------------------------------------------- output and the log file
+setup_colors() {
+  if [[ $COLOR != never && -z ${NO_COLOR:-} && -t 2 ]]; then
+    C_RED=$'\e[31m' C_GRN=$'\e[32m' C_YEL=$'\e[33m' C_BLU=$'\e[34m'
+    C_DIM=$'\e[2m'  C_BLD=$'\e[1m'  C_OFF=$'\e[0m'
+  fi
+  return 0
+}
+
+_log() {   # LEVEL MESSAGE -> activity.log (never fails the program)
+  { printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" "$2" >>"$LOG_FILE"; } 2>/dev/null || true
+  return 0
+}
+
+msg()  { _log INFO "$*";    printf '%s\n' "$*" >&2; }
+step() { _log STEP "$*";    printf '%s==>%s %s%s%s\n' "$C_BLU" "$C_OFF" "$C_BLD" "$*" "$C_OFF" >&2; }
+ok()   { _log SUCCESS "$*"; printf '%s[ ok ]%s %s\n' "$C_GRN" "$C_OFF" "$*" >&2; }
+warn() { _log WARN "$*";    printf '%s[warn]%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+err()  { ERR_REPORTED=1; _log ERROR "$*"; printf '%s[fail]%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+dbg()  { _log DEBUG "$*"; if (( VERBOSE )); then printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF" >&2; fi; return 0; }
+die()  { err "$*"; exit 1; }
+usage_error() { err "$*"; echo "Try '$PROG --help'." >&2; exit 2; }
+
+# if dry "what would happen"; then return 0; fi
+dry() {
+  if (( DRY_RUN )); then
+    _log DRYRUN "$*"
+    printf '%s[dry-run]%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2
+    return 0
+  fi
+  return 1
+}
+
+ask_yn() {   # PROMPT [DEFAULT y|n] - always asks, ignores --yes
+  local def=${2:-n} hint ans=
+  if [[ $def == y ]]; then hint='[Y/n]'; else hint='[y/N]'; fi
+  read -r -p "$1 $hint " ans || return 1
+  ans=${ans:-$def}
+  [[ $ans =~ ^[Yy] ]]
+}
+
+confirm() {  # routine questions; --yes answers them (nothing is changed in a dry run)
+  if (( ASSUME_YES || DRY_RUN )); then return 0; fi
+  if [[ ! -t 0 ]]; then
+    err "confirmation needed but stdin is not a terminal (use --yes)"
+    return 1
+  fi
+  ask_yn "$1" n
+}
+
+# guard "warning": a SAFETY warning. Only --force or an explicit yes at a terminal continues.
+guard() {
+  warn "$1"
+  if (( FORCE )); then
+    warn "continuing anyway because of --force"
+    return 0
+  fi
+  if dry "a real run would stop here unless you answer yes or pass --force"; then return 0; fi
+  if [[ -t 0 && -t 2 ]]; then
+    ask_yn "Continue anyway?" n
+    return
+  fi
+  err "refusing to continue (re-run with --force to override this check)"
+  return 1
+}
+
+# ------------------------------------------------------------ small helpers
+is_remote() { [[ $1 != /* ]]; }                    # local paths are always absolute
+unesc()     { printf '%b' "$1"; }                  # lsblk -r escapes as \xHH
+fmt_time()  { date -d "@$1" '+%Y-%m-%d %H:%M:%S'; }
+safe_opt()  { [[ $1 != *[,$'\n']* ]]; }            # safe inside a mount -o list
+
+as_root() {
+  if (( EUID == 0 )); then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    err "root privileges are needed for '$1' but sudo is not installed"
+    return 1
+  fi
+}
+
+expand_path() {
+  local p=$1
+  case $p in
+    "~")   p=$HOME ;;
+    "~/"*) p=$HOME/${p#"~/"} ;;
+  esac
+  p=${p//\$\{HOME\}/$HOME}
+  p=${p//\$HOME/$HOME}
+  printf '%s' "$p"
+}
+
+local_path() {   # expand ~ / $HOME and make absolute
+  local p
+  p=$(expand_path "$1")
+  if [[ $p != /* ]]; then p=$PWD/$p; fi
+  printf '%s' "$p"
+}
+
+jp() {   # join path parts; copes with empty parts and "remote:" roots
+  local a=$1 b=${2#/}
+  b=${b%/}
+  if [[ -z $b ]]; then
+    printf '%s' "${a%/}"
+  elif [[ -z $a || $a == *: ]]; then
+    printf '%s%s' "$a" "$b"
+  else
+    printf '%s/%s' "${a%/}" "$b"
+  fi
+}
+
+rpath_split() {   # remote:dir/name -> RP_DIR, RP_NAME (callers declare them local)
+  local p=$1
+  if [[ $p == */* ]]; then
+    RP_DIR=${p%/*}; RP_NAME=${p##*/}
+  else
+    RP_DIR=${p%%:*}:; RP_NAME=${p#*:}
+  fi
+}
+
+norm_loc() {
+  case ${1,,} in
+    pc|local|machine|computer)                  echo pc ;;
+    flash|usb|stick)                            echo flash ;;
+    nas)                                        echo nas ;;
+    gdrive|gd|google|googledrive|google-drive)  echo gdrive ;;
+    all)                                        echo all ;;
+    *) return 1 ;;
+  esac
+}
+
+register_tmp()   { CLEANUP_FILES+=("$1"); }
+unregister_tmp() {
+  local p
+  local -a keep=()
+  for p in "${CLEANUP_FILES[@]}"; do
+    if [[ $p != "$1" ]]; then keep+=("$p"); fi
+  done
+  CLEANUP_FILES=("${keep[@]}")
+}
+drop_tmp() {   # remove a temporary file (local or remote) and forget it
+  if is_remote "$1"; then
+    rclone deletefile "$1" >/dev/null 2>&1 || true
+  else
+    rm -f -- "$1" || true
+  fi
+  unregister_tmp "$1"
+}
+
+# --------------------------------------------------- cleanup, signals, locking
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  set +e
+  local p
+  for p in "${CLEANUP_FILES[@]}"; do
+    if is_remote "$p"; then rclone deletefile "$p" >/dev/null 2>&1; else rm -f -- "$p"; fi
+  done
+  CLEANUP_FILES=()
+  release_target
+  if (( rc != 0 && ERR_REPORTED == 0 )); then
+    err "aborted unexpectedly (exit status $rc); details: $LOG_FILE"
+  fi
+  if [[ -n $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi
+  _log INFO "finished with exit status $rc"
+  if (( LOCK_HELD )); then
+    flock -u 9 2>/dev/null
+    exec 9>&-
+  fi
+  exit "$rc"
+}
+
+on_signal() {
+  warn "interrupted by SIG$1 - cleaning up"
+  case $1 in
+    INT)  exit 130 ;;
+    TERM) exit 143 ;;
+    HUP)  exit 129 ;;
+    *)    exit 1 ;;
+  esac
+}
+
+acquire_lock() {
+  if ! { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
+    die "cannot open the lock file $LOCK_FILE"
+  fi
+  if ! flock -n 9; then
+    err "another $PROG is already running (lock: $LOCK_FILE); wait for it to finish"
+    exit 75
+  fi
+  LOCK_HELD=1
+  dbg "lock acquired"
+}
+
+# ------------------------------------------------------------- dependencies
+have_tool() {
+  local p
+  if [[ $1 == mount.cifs ]]; then
+    for p in "$(command -v mount.cifs 2>/dev/null || true)" /sbin/mount.cifs /usr/sbin/mount.cifs; do
+      if [[ -n $p && -x $p ]]; then printf '%s' "$p"; return 0; fi
+    done
+    return 1
+  fi
+  command -v "$1" 2>/dev/null
+}
+
+pkg_for() {
+  case $1 in
+    rclone)                      echo rclone ;;
+    mount.cifs)                  echo cifs-utils ;;
+    flock|lsblk|mountpoint)      echo util-linux ;;
+    sudo)                        echo sudo ;;
+    find)                        echo findutils ;;
+    *)                           echo coreutils ;;
+  esac
+}
+
+check_dependencies() {   # fails when something THIS command needs is missing
+  local tool pkg
+  local -a missing=() pkgs=() optional=()
+  for tool in "${CORE_TOOLS[@]}" "${NEEDS[@]}"; do
+    if have_tool "$tool" >/dev/null; then continue; fi
+    missing+=("$tool")
+    pkg=$(pkg_for "$tool")
+    case " ${pkgs[*]-} " in *" $pkg "*) ;; *) pkgs+=("$pkg") ;; esac
+  done
+  if (( ${#missing[@]} )); then
+    err "missing required program(s): ${missing[*]}"
+    err "install: ${pkgs[*]}   (for example: sudo apt install ${pkgs[*]})"
+    exit 1
+  fi
+  for tool in rclone mount.cifs; do
+    if ! have_tool "$tool" >/dev/null; then optional+=("$tool"); fi
+  done
+  if (( ${#optional[@]} )); then
+    dbg "not installed (only needed for NAS / Google Drive commands): ${optional[*]}"
+  fi
+  return 0
+}
+
+needs_for() {   # location -> extra programs it needs
+  case $1 in
+    flash)  if [[ -z $OPT_USB_PATH ]]; then NEEDS+=(lsblk); fi ;;
+    nas)    if (( ! NO_MOUNT )); then
+              NEEDS+=(mount.cifs mountpoint)
+              if (( EUID != 0 )); then NEEDS+=(sudo); fi
+            fi ;;
+    gdrive) NEEDS+=(rclone) ;;
+  esac
+  return 0
+}
+
+# --------------------------------------------------------------- config file
+validate_value() {   # KEY VALUE -> prints the problem and returns 1 if bad
+  local k=$1 v=$2
+  if [[ $v == *'"'* || $v == *$'\n'* ]]; then
+    echo "value must not contain double quotes or line breaks"; return 1
+  fi
+  case $k in
+    KEEP_BACKUPS)
+      if ! [[ $v =~ ^[0-9]+$ ]]; then echo "KEEP_BACKUPS must be a whole number"; return 1; fi ;;
+    GDRIVE_RETRIES)
+      if ! [[ $v =~ ^[0-9]+$ ]] || (( 10#$v < 1 || 10#$v > 10 )); then
+        echo "GDRIVE_RETRIES must be a number from 1 to 10"; return 1
+      fi ;;
+    DB_PATH|PC_BACKUP_DIR)
+      if [[ -z $v ]]; then echo "$k must not be empty"; return 1; fi ;;
+    NAS_ADDR)
+      if [[ -n $v && $v != //* ]]; then echo "NAS_ADDR must look like //host/share"; return 1; fi ;;
+    GDRIVE_REMOTE)
+      if ! [[ $v =~ ^[A-Za-z0-9_.-]+:?$ ]]; then echo "GDRIVE_REMOTE must be an rclone remote name"; return 1; fi ;;
+    USB_DB_DIR|USB_BACKUP_DIR|NAS_DB_DIR|NAS_BACKUP_DIR|GDRIVE_DB_DIR|GDRIVE_BACKUP_DIR)
+      case "/$v/" in
+        */../*|*/./*) echo "$k must not contain . or .. path components"; return 1 ;;
+      esac ;;
+  esac
+  return 0
+}
+
+check_config_perms() {   # a config that others can write could redirect your backups
+  local mode owner
+  mode=$(stat -c %a -- "$1") || return 1
+  owner=$(stat -c %u -- "$1") || return 1
+  if (( owner != EUID )); then
+    err "$1 is owned by another user; refusing to use it"
+    return 1
+  fi
+  if (( (8#$mode & 022) != 0 )); then
+    err "$1 is writable by group/others (mode $mode); fix with: chmod 600 $1"
+    return 1
+  fi
+}
+
+load_config() {
+  local file=$1 line key val problem
+  local re_kv='^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$'
+  local re_dq='^"(.*)"[[:space:]]*$' re_sq="^'(.*)'[[:space:]]*\$"
+  if [[ ! -r $file ]]; then return 0; fi
+  check_config_perms "$file" || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    if [[ $line =~ ^[[:space:]]*(#|$) ]]; then continue; fi
+    if [[ $line =~ $re_kv ]]; then
+      key=${BASH_REMATCH[1]} val=${BASH_REMATCH[2]}
+      if   [[ $val =~ $re_dq ]]; then val=${BASH_REMATCH[1]}
+      elif [[ $val =~ $re_sq ]]; then val=${BASH_REMATCH[1]}
+      else val=${val%"${val##*[![:space:]]}"}
+      fi
+      if [[ -z ${DEF[$key]+x} ]]; then
+        warn "$file: unknown setting '$key' ignored"
+      elif problem=$(validate_value "$key" "$val"); then
+        CFG[$key]=$val
+      else
+        warn "$file: $key: $problem (using the default)"
+      fi
+    else
+      warn "$file: cannot parse line: $line"
+    fi
+  done < "$file"
+  return 0
+}
+
+write_config_file() {
+  local file=$1 k
+  mkdir -p -- "$(dirname -- "$file")" || return 1
+  {
+    echo "# $PROG configuration. Edit by hand or use: $PROG config set KEY VALUE"
+    echo "# '~' and \$HOME are expanded. Values may be quoted. Lines starting with # are comments."
+    for k in "${CFG_KEYS[@]}"; do
+      echo
+      echo "# ${DESC[$k]}"
+      printf '%s="%s"\n' "$k" "${CFG[$k]}"
+    done
+  } > "$file" || return 1
+  chmod 600 -- "$file" || return 1
+}
+
+config_set_file() {   # KEY VALUE: change one line, keep the rest of the file
+  local key=$1 val=$2 line found=0
+  local -a out=()
+  if [[ ! -f $CONFIG_FILE ]]; then write_config_file "$CONFIG_FILE" || return 1; fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line =~ ^[[:space:]]*$key[[:space:]]*= ]]; then
+      if (( ! found )); then out+=("$key=\"$val\""); found=1; fi
+    else
+      out+=("$line")
+    fi
+  done < "$CONFIG_FILE"
+  if (( ! found )); then out+=("$key=\"$val\""); fi
+  printf '%s\n' "${out[@]}" > "$CONFIG_FILE" || return 1
+}
+
+init_db_names() {
+  PC_DB=$(local_path "${CFG[DB_PATH]}")
+  PC_BACKUP_DIR=$(local_path "${CFG[PC_BACKUP_DIR]}")
+  DB_FILE=${PC_DB##*/}
+  if [[ -z $DB_FILE ]]; then die "DB_PATH does not name a file: ${CFG[DB_PATH]}"; fi
+  if [[ $DB_FILE == *.* ]]; then
+    DB_STEM=${DB_FILE%.*}; DB_SUFFIX=.${DB_FILE##*.}
+  else
+    DB_STEM=$DB_FILE; DB_SUFFIX=
+  fi
+  TS=$(date +%Y%m%d_%H%M%S)
+}
+
+require_pc_db() {
+  if [[ -f $PC_DB ]]; then return 0; fi
+  err "PC database not found: $PC_DB (set DB_PATH with '$PROG init' or '$PROG config set DB_PATH ...')"
+  return 1
+}
+
+# ------------------------------------------------- rclone (Google Drive) layer
+rc_run() {   # rclone SUBCOMMAND ARGS... with retries and back-off; stdout passes through
+  local attempt=1 max=${CFG[GDRIVE_RETRIES]} delay=$RETRY_BASE_DELAY rc errf errtxt
+  errf=$TMP_DIR/rclone.err
+  while :; do
+    rc=0
+    rclone "${RCLONE_FLAGS[@]}" "$@" 2>"$errf" || rc=$?
+    if (( rc == 0 )); then return 0; fi
+    if (( rc == 3 || rc == 4 )); then return "$rc"; fi      # not found: retrying will not help
+    errtxt=$(tr '\n' ' ' <"$errf" | cut -c1-300 || true)
+    if (( attempt >= max )); then
+      err "rclone $1 failed after $attempt attempt(s) (exit $rc): $errtxt"
+      return "$rc"
+    fi
+    if [[ ${errtxt,,} =~ rate.?limit|429|quota|too.many ]]; then
+      warn "Google Drive rate limit hit; waiting ${delay}s (attempt $attempt of $max)"
+    else
+      warn "rclone $1 failed (exit $rc); retrying in ${delay}s (attempt $attempt of $max)"
+    fi
+    sleep "$delay"
+    delay=$((delay * 2)); attempt=$((attempt + 1))
+  done
+}
+
+rc_entry() {   # the lsjson line describing one remote file
+  local RP_DIR RP_NAME out line
+  rpath_split "$1"
+  out=$(rc_run lsjson --files-only "$RP_DIR") || return 1
+  while IFS= read -r line; do
+    if [[ $line == *'"Path":"'"$RP_NAME"'"'* ]]; then printf '%s' "$line"; return 0; fi
+  done <<<"$out"
+  return 1
+}
+
+rc_mtime() {
+  local line re='"ModTime":"([^"]+)"'
+  line=$(rc_entry "$1") || return 1
+  [[ $line =~ $re ]] || return 1
+  date -d "${BASH_REMATCH[1]}" +%s
+}
+
+rc_size() {
+  local line re='"Size":([0-9]+)'
+  line=$(rc_entry "$1") || return 1
+  [[ $line =~ $re ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# ------------------------------- path layer: every path is local or "remote:..."
+sha_local() {
+  local out
+  out=$(sha256sum -- "$1" 2>/dev/null) || return 1
+  out=${out#\\}
+  printf '%s' "${out%% *}"
+}
+
+p_sha256() {   # remote files are downloaded and hashed locally (Drive has no SHA-256)
+  local p=$1 dl h
+  if is_remote "$p"; then
+    dl=$(mktemp "$TMP_DIR/dl.XXXXXX") || return 1
+    if ! rc_run copyto --ignore-times "$p" "$dl" >/dev/null; then rm -f -- "$dl"; return 1; fi
+    h=$(sha_local "$dl") || { rm -f -- "$dl"; return 1; }
+    rm -f -- "$dl"
+    printf '%s' "$h"
+  else
+    sha_local "$p"
+  fi
+}
+
+p_list() {   # file names inside a folder, sorted; a missing folder is empty
+  local out rc=0
+  if is_remote "$1"; then
+    out=$(rc_run lsf --files-only "$1") || rc=$?
+    if (( rc == 3 )); then return 0; fi
+    if (( rc != 0 )); then return 1; fi
+    if [[ -n $out ]]; then printf '%s\n' "$out" | LC_ALL=C sort; fi
+  elif [[ -d $1 ]]; then
+    find "$1" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort
+  fi
+}
+
+p_exists() {   # 0 = yes, 1 = no, 2 = could not tell
+  local RP_DIR RP_NAME list
+  if is_remote "$1"; then
+    rpath_split "$1"
+    list=$(p_list "$RP_DIR") || return 2
+    if [[ $'\n'$list$'\n' == *$'\n'"$RP_NAME"$'\n'* ]]; then return 0; fi
+    return 1
+  fi
+  if [[ -f $1 ]]; then return 0; fi
+  return 1
+}
+
+p_mtime() { if is_remote "$1"; then rc_mtime "$1"; else stat -c %Y -- "$1"; fi; }
+p_size()  { if is_remote "$1"; then rc_size "$1";  else stat -c %s -- "$1"; fi; }
+
+p_mkdir() {
+  if is_remote "$1"; then
+    if dry "mkdir $1"; then return 0; fi
+    rc_run mkdir "$1" >/dev/null || { err "could not create $1"; return 1; }
+  else
+    if [[ -d $1 ]]; then return 0; fi
+    if dry "mkdir -p $1"; then return 0; fi
+    mkdir -p -- "$1" || { err "could not create $1"; return 1; }
+  fi
+}
+
+p_rm() {
+  if dry "delete $1"; then return 0; fi
+  if is_remote "$1"; then
+    rc_run deletefile "$1" >/dev/null || { err "could not delete $1"; return 1; }
+  else
+    rm -f -- "$1" || { err "could not delete $1"; return 1; }
+  fi
+}
+
+sync_path() {
+  if ! is_remote "$1"; then sync -- "$1" 2>/dev/null || sync || true; fi
+  return 0
+}
+
+raw_copy() {   # SRC DST; either side may be remote
+  if is_remote "$1" || is_remote "$2"; then
+    rc_run copyto --ignore-times "$1" "$2" >/dev/null || return 1
+  else
+    cp --preserve=timestamps -- "$1" "$2" || return 1
+  fi
+}
+
+raw_move() {   # both paths on the same side
+  if is_remote "$1"; then
+    rc_run moveto "$1" "$2" >/dev/null || return 1
+  else
+    mv -f -- "$1" "$2" || return 1
+  fi
+}
+
+tmp_path_for() {   # hidden temporary sibling of a destination
+  local RP_DIR RP_NAME
+  if is_remote "$1"; then
+    rpath_split "$1"
+    jp "$RP_DIR" ".${RP_NAME}.kp-tmp.$$"
+  else
+    printf '%s/.%s.kp-tmp.%s' "$(dirname -- "$1")" "$(basename -- "$1")" "$$"
+  fi
+}
+
+# safe_copy SRC DST: hash the source, copy to a temporary name, verify the temporary
+# file, move it into place, verify the final file. DST is never half-written.
+safe_copy() {
+  local src=$1 dst=$2 tmp src_hash got
+  src_hash=$(p_sha256 "$src") || { err "cannot read/hash the source $src"; return 1; }
+  dbg "sha256 before copy:    $src_hash  $src"
+  tmp=$(tmp_path_for "$dst")
+  if dry "copy $src -> $dst (via temporary file, sha256 ${src_hash:0:12}...)"; then return 0; fi
+  register_tmp "$tmp"
+  if ! raw_copy "$src" "$tmp"; then
+    drop_tmp "$tmp"; err "copy to $tmp failed; $dst was not touched"; return 1
+  fi
+  got=$(p_sha256 "$tmp") || { drop_tmp "$tmp"; err "cannot verify the temporary copy; $dst was not touched"; return 1; }
+  dbg "sha256 of temporary:   $got"
+  if [[ $got != "$src_hash" ]]; then
+    drop_tmp "$tmp"
+    err "CHECKSUM MISMATCH while copying to $dst (expected ${src_hash:0:16}..., got ${got:0:16}...); $dst was not touched"
+    return 1
+  fi
+  if ! raw_move "$tmp" "$dst"; then
+    drop_tmp "$tmp"; err "could not move the verified copy into place at $dst"; return 1
+  fi
+  unregister_tmp "$tmp"
+  sync_path "$dst"
+  got=$(p_sha256 "$dst") || { err "copied to $dst but cannot verify it afterwards"; return 1; }
+  if [[ $got != "$src_hash" ]]; then
+    err "CHECKSUM MISMATCH AFTER MOVE: $dst differs from its source - do not trust it"
+    return 1
+  fi
+  dbg "sha256 after move:     $got  $dst"
+  _log INFO "copied $src -> $dst sha256=$src_hash"
+}
+
+# ------------------------------------------------- database sanity (KDBX 2.x/4.x)
+check_kdbx() {   # local file starts with the KeePass 2.x signature
+  local sig
+  sig=$(head -c 8 -- "$1" | od -An -tx1 | tr -d ' \n') || return 1
+  [[ $sig == 03d9a29a67fb4bb5 ]]
+}
+
+guard_source() {   # PATH LABEL: a non-KDBX source is a safety warning
+  local f=$1 label=$2 dl= sig_ok=0
+  if is_remote "$f"; then
+    dl=$(mktemp "$TMP_DIR/sig.XXXXXX") || return 1
+    if rc_run copyto --ignore-times "$f" "$dl" >/dev/null; then
+      f=$dl
+    else
+      rm -f -- "$dl"; err "cannot read $label"; return 1
+    fi
+  fi
+  if check_kdbx "$f"; then sig_ok=1; fi
+  if [[ -n $dl ]]; then rm -f -- "$dl"; fi
+  if (( sig_ok )); then return 0; fi
+  guard "$label does not look like a KeePass 2.x (KDBX) database - it may be empty, truncated or the wrong file"
+}
+
+# ----------------------------------------------------------------- backups
+is_backup_name() {   # <stem>_YYYYMMDD_HHMMSS[_N]<suffix>
+  local n=$1 mid
+  [[ $n == "${DB_STEM}_"*"$DB_SUFFIX" ]] || return 1
+  mid=${n#"${DB_STEM}_"}
+  mid=${mid%"$DB_SUFFIX"}
+  [[ $mid =~ ^[0-9]{8}_[0-9]{6}(_[0-9]+)?$ ]]
+}
+
+list_backups() {   # DIR -> backup names, oldest first
+  local all n
+  all=$(p_list "$1") || return 1
+  while IFS= read -r n; do
+    if [[ -n $n ]] && is_backup_name "$n"; then printf '%s\n' "$n"; fi
+  done <<<"$all"
+}
+
+backup_dest() {   # DIR -> a free backup path for this run's timestamp
+  local dir=$1 n=1 name path ex
+  name=${DB_STEM}_${TS}${DB_SUFFIX}
+  path=$(jp "$dir" "$name")
+  while :; do
+    ex=0; p_exists "$path" || ex=$?
+    case $ex in
+      0) ;;
+      1) break ;;
+      *) return 1 ;;
+    esac
+    n=$((n + 1))
+    name=${DB_STEM}_${TS}_${n}${DB_SUFFIX}
+    path=$(jp "$dir" "$name")
+  done
+  printf '%s' "$path"
+}
+
+make_backup() {   # SRC DIR: verified, timestamped copy of SRC inside DIR
+  local src=$1 dir=$2 dst
+  p_mkdir "$dir" || return 1
+  dst=$(backup_dest "$dir") || { err "cannot choose a backup name in $dir"; return 1; }
+  safe_copy "$src" "$dst" || return 1
+  BACKUP_MADE=$dst
+}
+
+prune_dir() {   # DIR KEEP ASK(0|1): delete the oldest backups beyond KEEP
+  local dir=$1 keep=$2 ask=$3 list n total
+  local -a all=() del=()
+  list=$(list_backups "$dir") || return 1
+  if [[ -z $list ]]; then return 0; fi
+  mapfile -t all <<<"$list"
+  total=${#all[@]}
+  if (( total <= keep )); then return 0; fi
+  del=("${all[@]:0:total-keep}")
+  if (( ask )); then
+    msg "Will delete the ${#del[@]} oldest of $total backups in $dir (keeping $keep):"
+    printf '  %s\n' "${del[@]}" >&2
+    confirm "Delete them?" || return 1
+  fi
+  for n in "${del[@]}"; do
+    p_rm "$(jp "$dir" "$n")" || return 1
+    _log INFO "deleted old backup $dir/$n"
+  done
+  msg "Backup rotation in $dir: removed ${#del[@]}, kept $keep"
+}
+
+auto_rotate() {   # DIR: honour KEEP_BACKUPS (0 = keep everything)
+  local keep=${OPT_KEEP:-${CFG[KEEP_BACKUPS]}}
+  if [[ $keep =~ ^[0-9]+$ ]] && (( 10#$keep > 0 )); then
+    prune_dir "$1" "$((10#$keep))" 0
+  fi
+}
+
+# ------------------------------------------------------- location: PC
+prepare_pc() {
+  T_DBDIR=$(dirname -- "$PC_DB")
+  T_BKDIR=$PC_BACKUP_DIR
+  T_DB=$PC_DB
+}
+
+# ------------------------------------------------------- location: NAS
+check_secret_file() {   # exists, ours, and not readable by anyone else
+  local mode owner
+  if [[ ! -f $1 ]]; then err "credentials file not found: $1 (run: $PROG init)"; return 1; fi
+  mode=$(stat -c %a -- "$1") || return 1
+  owner=$(stat -c %u -- "$1") || return 1
+  if (( owner != EUID )); then err "credentials file $1 is owned by another user"; return 1; fi
+  if (( (8#$mode & 077) != 0 )); then
+    err "credentials file $1 is accessible by others (mode $mode); fix with: chmod 600 $1"
+    return 1
+  fi
+}
+
+nas_mount() {   # MOUNTPOINT -> 0 mounted, 1 failed, 3 dry run
+  local mnt=$1 addr=${CFG[NAS_ADDR]} user=${CFG[NAS_USER]} creds=${CFG[NAS_CREDENTIALS]} opts
+  if [[ -z $addr ]]; then err "NAS_ADDR is not set (run: $PROG init)"; return 1; fi
+  if [[ -n $creds ]]; then
+    creds=$(local_path "$creds")
+    check_secret_file "$creds" || return 1
+    safe_opt "$creds" || { err "NAS_CREDENTIALS must not contain commas"; return 1; }
+    opts="credentials=$creds"
+  elif [[ -n $user ]]; then
+    safe_opt "$user" || { err "NAS_USER must not contain commas"; return 1; }
+    opts="username=$user"
+  else
+    err "set NAS_CREDENTIALS or NAS_USER (run: $PROG init)"; return 1
+  fi
+  opts+=",uid=$(id -u),gid=$(id -g),file_mode=0600,dir_mode=0700,nosuid,nodev,noexec"
+  if [[ -n ${CFG[NAS_MOUNT_OPTS]} ]]; then opts+=",${CFG[NAS_MOUNT_OPTS]}"; fi
+  if dry "sudo mount -t cifs $addr $mnt -o $opts"; then return 3; fi
+  if [[ ! -d $mnt ]]; then
+    as_root mkdir -p -- "$mnt" || { err "could not create the mount point $mnt"; return 1; }
+  fi
+  msg "Mounting $addr on $mnt (sudo and/or the NAS may ask for a password)"
+  if ! as_root mount -t cifs "$addr" "$mnt" -o "$opts"; then
+    err "could not mount $addr (is cifs-utils installed? are address and credentials right?)"
+    return 1
+  fi
+  T_MOUNTED_NAS=$mnt
+  _log INFO "mounted $addr on $mnt"
+}
+
+prepare_nas() {
+  local mnt rc=0 temp=0
+  if [[ -n ${CFG[NAS_MOUNT]} ]]; then
+    mnt=$(local_path "${CFG[NAS_MOUNT]}")
+  elif (( NO_MOUNT )); then
+    err "--no-mount needs NAS_MOUNT to be set"; return 1
+  else
+    mnt=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/kp-manager-nas.XXXXXX") || return 1
+    temp=1
+  fi
+  if (( NO_MOUNT )); then
+    if [[ ! -d $mnt ]]; then err "NAS folder not found: $mnt"; return 1; fi
+  elif mountpoint -q -- "$mnt" 2>/dev/null; then
+    dbg "NAS already mounted on $mnt (leaving it mounted afterwards)"
+  else
+    nas_mount "$mnt" || rc=$?
+    if (( rc == 0 )); then
+      T_MOUNTED_NAS_TEMP=$temp
+    else
+      if (( temp )); then rmdir -- "$mnt" 2>/dev/null || true; fi
+      return "$rc"
+    fi
+  fi
+  T_DBDIR=$(jp "$mnt" "${CFG[NAS_DB_DIR]}")
+  T_BKDIR=$(jp "$mnt" "${CFG[NAS_BACKUP_DIR]}")
+  T_DB=$(jp "$T_DBDIR" "$DB_FILE")
+}
+
+# ------------------------------------------------------- location: USB flash
+usb_scan() {   # fills USB_DEV / USB_DESC / USB_MNT with plugged-in USB partitions
+  USB_DEV=() USB_DESC=() USB_MNT=()
+  local path type fstype size rmflag hotplug tran mnt label mdec ldec
+  while IFS='|' read -r path type fstype size rmflag hotplug tran mnt label; do
+    if [[ -z $path ]]; then continue; fi
+    case $type in part|disk) ;; *) continue ;; esac
+    if [[ -z $fstype ]]; then continue; fi
+    case $fstype in
+      crypto_LUKS|swap|LVM2_member|LVM1_member|linux_raid_member|isw_raid_member|zfs_member) continue ;;
+    esac
+    if [[ $rmflag != 1 && $hotplug != 1 && $tran != usb ]]; then continue; fi
+    mdec=$(unesc "$mnt")
+    case $mdec in /|/boot|/boot/*|/efi|/home|/usr|/var) continue ;; esac
+    ldec=$(unesc "$label")
+    USB_DEV+=("$path"); USB_MNT+=("$mdec")
+    USB_DESC+=("$(printf '%-14s %-7s %-6s %s%s' "$path" "$size" "$fstype" "${ldec:-(no label)}" "${mdec:+   [mounted at $mdec]}")")
+  done < <(lsblk -rn -o PATH,TYPE,FSTYPE,SIZE,RM,HOTPLUG,TRAN,MOUNTPOINT,LABEL 2>/dev/null | tr ' ' '|' || true)
+  return 0
+}
+
+usb_choose() {   # sets USB_SEL_DEV and USB_SEL_MNT
+  USB_SEL_DEV= USB_SEL_MNT=
+  local i n ans mnt
+  if [[ -n $OPT_DEVICE ]]; then
+    if [[ ! -b $OPT_DEVICE ]]; then err "not a block device: $OPT_DEVICE"; return 1; fi
+    USB_SEL_DEV=$OPT_DEVICE
+    mnt=$(lsblk -rno MOUNTPOINT "$OPT_DEVICE" 2>/dev/null || true)
+    USB_SEL_MNT=$(unesc "${mnt%%$'\n'*}")
+    return 0
+  fi
+  usb_scan
+  n=${#USB_DEV[@]}
+  if (( n == 0 )); then
+    err "no USB drive found - plug one in, or use --usb-path DIR / --device DEV"
+    return 1
+  fi
+  if (( n == 1 && ASSUME_YES )); then
+    ans=1
+  elif [[ ! -t 0 ]]; then
+    err "cannot ask which drive to use (stdin is not a terminal); pass --device DEV or --usb-path DIR"
+    return 1
+  else
+    printf '\nAvailable USB drives:\n' >&2
+    for ((i = 0; i < n; i++)); do printf '  %d) %s\n' $((i + 1)) "${USB_DESC[i]}" >&2; done
+    while :; do
+      if (( n == 1 )); then
+        read -r -p "Select drive [1]: " ans || return 1
+        ans=${ans:-1}
+      else
+        read -r -p "Select drive [1-$n, q to quit]: " ans || return 1
+      fi
+      if [[ $ans == [qQ] ]]; then msg "Cancelled."; return 1; fi
+      if [[ $ans =~ ^[0-9]+$ ]] && (( 10#$ans >= 1 && 10#$ans <= n )); then break; fi
+      warn "please enter a number from 1 to $n"
+    done
+  fi
+  USB_SEL_DEV=${USB_DEV[$((10#$ans - 1))]}
+  USB_SEL_MNT=${USB_MNT[$((10#$ans - 1))]}
+}
+
+usb_mount() {   # DEV -> 0 mounted (USB_SEL_MNT set), 1 failed, 3 dry run
+  local dev=$1 out mnt fstype opts=
+  if (( NO_MOUNT )); then err "$dev is not mounted (and --no-mount is set)"; return 1; fi
+  if dry "mount $dev"; then return 3; fi
+  if command -v udisksctl >/dev/null 2>&1; then
+    msg "Mounting $dev"
+    out=$(udisksctl mount -b "$dev" --no-user-interaction) || { err "could not mount $dev"; return 1; }
+    dbg "$out"
+    T_MOUNTED_USB=$dev T_MOUNTED_USB_MODE=udisks
+    mnt=$(lsblk -rno MOUNTPOINT "$dev" 2>/dev/null || true)
+    USB_SEL_MNT=$(unesc "${mnt%%$'\n'*}")
+  else
+    mnt=/mnt/kp-manager-usb
+    fstype=$(lsblk -rno FSTYPE "$dev" 2>/dev/null || true)
+    fstype=${fstype%%$'\n'*}
+    case $fstype in vfat|exfat|ntfs|ntfs3|msdos) opts="uid=$(id -u),gid=$(id -g)" ;; esac
+    msg "Mounting $dev on $mnt (needs sudo; install udisks2 to avoid this)"
+    as_root mkdir -p -- "$mnt" || return 1
+    as_root mount ${opts:+-o "$opts"} "$dev" "$mnt" || { err "could not mount $dev"; return 1; }
+    T_MOUNTED_USB=$dev T_MOUNTED_USB_MODE=mount T_MOUNTED_USB_PATH=$mnt
+    USB_SEL_MNT=$mnt
+  fi
+  if [[ -z $USB_SEL_MNT ]]; then err "mounted $dev but could not find its mount point"; return 1; fi
+  _log INFO "mounted $dev on $USB_SEL_MNT"
+}
+
+prepare_flash() {
+  local root rc=0
+  if [[ -n $OPT_USB_PATH ]]; then
+    root=$(local_path "$OPT_USB_PATH")
+    if [[ ! -d $root ]]; then err "not a directory: $root"; return 1; fi
+  else
+    usb_choose || return 1
+    if [[ -z $USB_SEL_MNT ]]; then
+      usb_mount "$USB_SEL_DEV" || rc=$?
+      if (( rc != 0 )); then return "$rc"; fi
+    fi
+    root=$USB_SEL_MNT
+  fi
+  msg "Using flash drive at $root"
+  T_DBDIR=$(jp "$root" "${CFG[USB_DB_DIR]}")
+  T_BKDIR=$(jp "$root" "${CFG[USB_BACKUP_DIR]}")
+  T_DB=$(jp "$T_DBDIR" "$DB_FILE")
+}
+
+# ------------------------------------------------------- location: Google Drive
+prepare_gdrive() {
+  local remote=${CFG[GDRIVE_REMOTE]%:} remotes
+  if [[ -z $remote ]]; then err "GDRIVE_REMOTE is not set (run: $PROG init)"; return 1; fi
+  remotes=$(rclone listremotes 2>/dev/null) || { err "rclone could not list its remotes"; return 1; }
+  if [[ $'\n'$remotes$'\n' != *$'\n'"$remote:"$'\n'* ]]; then
+    err "rclone remote '$remote' does not exist; create it with: rclone config   (name it '$remote', type 'drive')"
+    return 1
+  fi
+  T_DBDIR=$(jp "$remote:" "${CFG[GDRIVE_DB_DIR]}")
+  T_BKDIR=$(jp "$remote:" "${CFG[GDRIVE_BACKUP_DIR]}")
+  T_DB=$(jp "$T_DBDIR" "$DB_FILE")
+}
+
+# ------------------------------------------------------- target plumbing
+prepare_target() {
+  T_LOC=$1
+  case $1 in
+    pc)     prepare_pc ;;
+    flash)  prepare_flash ;;
+    nas)    prepare_nas ;;
+    gdrive) prepare_gdrive ;;
+  esac
+}
+
+release_target() {   # undo whatever mounting this run did; safe to call twice
+  local m d mode p
+  if [[ -n $T_MOUNTED_USB ]]; then
+    d=$T_MOUNTED_USB mode=$T_MOUNTED_USB_MODE p=$T_MOUNTED_USB_PATH
+    T_MOUNTED_USB= T_MOUNTED_USB_MODE= T_MOUNTED_USB_PATH=
+    sync || true
+    msg "Unmounting $d"
+    if [[ $mode == udisks ]]; then
+      if udisksctl unmount -b "$d" --no-user-interaction >/dev/null; then ok "$d can be removed safely"
+      else warn "could not unmount $d"; fi
+    else
+      if as_root umount "$p"; then
+        as_root rmdir "$p" 2>/dev/null || true
+        ok "$d can be removed safely"
+      else
+        warn "could not unmount $p"
+      fi
+    fi
+  fi
+  if [[ -n $T_MOUNTED_NAS ]]; then
+    m=$T_MOUNTED_NAS; T_MOUNTED_NAS=
+    msg "Unmounting $m"
+    if as_root umount "$m"; then
+      ok "NAS unmounted"
+      if (( T_MOUNTED_NAS_TEMP )); then rmdir -- "$m" 2>/dev/null || true; fi
+    else
+      warn "could not unmount $m (is something still using it?)"
+    fi
+    T_MOUNTED_NAS_TEMP=0
+  fi
+  return 0
+}
+
+# with_target LOCATION LABEL FUNCTION [ARGS...]: prepare, run, ALWAYS release
+with_target() {
+  local loc=$1 label=$2 fn=$3 rc=0 prep=0
+  shift 3
+  step "$label"
+  prepare_target "$loc" || prep=$?
+  if (( prep == 0 )); then
+    "$fn" "$@" || rc=$?
+  elif (( prep != 3 )); then      # 3 = dry run stopped before mounting
+    rc=1
+  fi
+  release_target
+  return "$rc"
+}
+
+run_targets() {   # LABEL FUNCTION LOCATION...
+  local label=$1 fn=$2 loc
+  local -a failed=()
+  shift 2
+  for loc in "$@"; do
+    with_target "$loc" "$label $loc" "$fn" || failed+=("$loc")
+  done
+  if (( ${#failed[@]} )); then
+    if (( $# > 1 )); then err "failed: ${failed[*]}"; fi
+    return 1
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------ commands
+_update_inner() {
+  local ex=0 pc_hash old_hash= pc_size old_size pc_t new_t
+  guard_source "$PC_DB" "the PC database" || return 1
+  pc_hash=$(p_sha256 "$PC_DB") || { err "cannot read $PC_DB"; return 1; }
+  p_exists "$T_DB" || ex=$?
+  case $ex in
+    0)
+      old_hash=$(p_sha256 "$T_DB") || old_hash=
+      if [[ -n $old_hash && $old_hash == "$pc_hash" ]]; then
+        if (( ! FORCE )); then
+          ok "$T_LOC already has this exact database (sha256 ${pc_hash:0:12}...) - nothing to do"
+          return 0
+        fi
+        warn "$T_LOC already has this exact database; updating anyway (--force)"
+      fi
+      pc_size=$(stat -c %s -- "$PC_DB") || return 1
+      if old_size=$(p_size "$T_DB") && (( old_size > 0 && pc_size * 2 < old_size )); then
+        guard "the PC database ($pc_size bytes) is less than half the size of the copy on $T_LOC ($old_size bytes)" || return 1
+      fi
+      pc_t=$(stat -c %Y -- "$PC_DB") || return 1
+      if new_t=$(p_mtime "$T_DB") && (( new_t > pc_t + 2 )); then
+        guard "the database on $T_LOC is NEWER than the PC copy ($T_LOC: $(fmt_time "$new_t"), PC: $(fmt_time "$pc_t"))" || return 1
+      fi
+      msg "Backing up the existing $T_LOC database first"
+      make_backup "$T_DB" "$T_BKDIR" || return 1
+      msg "  old version saved as ${BACKUP_MADE##*/}"
+      ;;
+    1) msg "No database on $T_LOC yet - creating it" ;;
+    *) err "cannot tell whether $T_DB exists"; return 1 ;;
+  esac
+  p_mkdir "$T_DBDIR" || return 1
+  safe_copy "$PC_DB" "$T_DB" || return 1
+  ok "$T_LOC updated and verified: $T_DB"
+  auto_rotate "$T_BKDIR" || warn "could not rotate old backups in $T_BKDIR"
+  return 0
+}
+
+cmd_update() {   # LOCATION...
+  local a loc
+  local -a targets=()
+  if (( $# == 0 )); then usage_error "update: which location? (flash | nas | gdrive)"; fi
+  for a in "$@"; do
+    loc=$(norm_loc "$a") || usage_error "unknown location: $a"
+    case $loc in
+      all) targets+=(flash nas gdrive) ;;
+      pc)  usage_error "the PC copy is the source of every update (see backup-pc and restore)" ;;
+      *)   targets+=("$loc") ;;
+    esac
+  done
+  require_pc_db || return 1
+  run_targets Update _update_inner "${targets[@]}"
+}
+
+_backup_inner() {
+  local ex=0
+  p_exists "$T_DB" || ex=$?
+  case $ex in
+    0) ;;
+    1) err "no database at $T_DB - nothing to back up"; return 1 ;;
+    *) err "cannot tell whether $T_DB exists"; return 1 ;;
+  esac
+  guard_source "$T_DB" "the database on $T_LOC" || return 1
+  make_backup "$T_DB" "$T_BKDIR" || return 1
+  ok "backup created and verified: $BACKUP_MADE"
+  auto_rotate "$T_BKDIR" || warn "could not rotate old backups in $T_BKDIR"
+  return 0
+}
+
+cmd_backup() {   # LOCATION...
+  local a loc
+  local -a targets=()
+  if (( $# == 0 )); then usage_error "backup: which location? (pc | flash | nas | gdrive)"; fi
+  for a in "$@"; do
+    loc=$(norm_loc "$a") || usage_error "unknown location: $a"
+    if [[ $loc == all ]]; then targets+=(pc flash nas gdrive); else targets+=("$loc"); fi
+  done
+  run_targets Backup _backup_inner "${targets[@]}"
+}
+
+_list_inner() {
+  local list
+  local -a names=()
+  list=$(list_backups "$T_BKDIR") || return 1
+  if [[ -n $list ]]; then
+    printf '%s\n' "$list"
+    mapfile -t names <<<"$list"
+  fi
+  msg "${#names[@]} backup(s) in $T_BKDIR"
+}
+
+cmd_list() {
+  local loc
+  if [[ -z ${1:-} ]]; then usage_error "list: which location? (pc | flash | nas | gdrive)"; fi
+  loc=$(norm_loc "$1") || usage_error "list: unknown location: $1"
+  if [[ $loc == all ]]; then usage_error "list: pick one location"; fi
+  with_target "$loc" "Backups on $loc" _list_inner
+}
+
+_diff_inner() {
+  local ex=0 pc_h t_h pc_t t_t pc_size t_size tt verdict=differs
+  pc_h=$(p_sha256 "$PC_DB") || { err "cannot read $PC_DB"; return 1; }
+  pc_t=$(stat -c %Y -- "$PC_DB") || return 1
+  pc_size=$(stat -c %s -- "$PC_DB") || return 1
+  printf '%-8s %s  %10s B  %s\n' pc "${pc_h:0:16}" "$pc_size" "$(fmt_time "$pc_t")"
+  p_exists "$T_DB" || ex=$?
+  case $ex in
+    0) ;;
+    1) printf '%-8s (no database at %s)\n' "$T_LOC" "$T_DB"
+       echo "result: MISSING on $T_LOC"
+       return 4 ;;
+    *) err "cannot tell whether $T_DB exists"; return 1 ;;
+  esac
+  t_h=$(p_sha256 "$T_DB") || { err "cannot read $T_DB"; return 1; }
+  t_size=$(p_size "$T_DB") || t_size=-
+  if t_t=$(p_mtime "$T_DB"); then tt=$(fmt_time "$t_t"); else tt=unknown; t_t=; fi
+  printf '%-8s %s  %10s B  %s\n' "$T_LOC" "${t_h:0:16}" "$t_size" "$tt"
+  if [[ $t_h == "$pc_h" ]]; then echo "result: identical"; return 0; fi
+  if [[ -n $t_t ]]; then
+    if   (( t_t > pc_t + 2 )); then verdict="differs ($T_LOC is newer)"
+    elif (( pc_t > t_t + 2 )); then verdict="differs (PC is newer)"
+    fi
+  fi
+  echo "result: $verdict"
+  return 4
+}
+
+cmd_diff() {
+  local loc
+  if [[ -z ${1:-} ]]; then usage_error "diff: which location? (flash | nas | gdrive)"; fi
+  loc=$(norm_loc "$1") || usage_error "diff: unknown location: $1"
+  if [[ $loc == pc || $loc == all ]]; then usage_error "diff: pick flash, nas or gdrive"; fi
+  require_pc_db || return 1
+  with_target "$loc" "Compare PC with $loc" _diff_inner
+}
+
+_restore_inner() {   # runs against the location we restore FROM
+  local sel=$1 src name list ex=0 i n ans pc_dir shown
+  local -a all=()
+  list=$(list_backups "$T_BKDIR") || return 1
+  if [[ -n $list ]]; then mapfile -t all <<<"$list"; fi
+  n=${#all[@]}
+
+  case $sel in
+    current)
+      if [[ $T_LOC == pc ]]; then err "'current' means the live database of a location; for the PC pick a backup"; return 1; fi
+      src=$T_DB ;;
+    latest)
+      if (( n == 0 )); then err "no backups found in $T_BKDIR"; return 1; fi
+      src=$(jp "$T_BKDIR" "${all[n-1]}") ;;
+    "")
+      if (( n == 0 )); then err "no backups found in $T_BKDIR"; return 1; fi
+      if [[ ! -t 0 ]]; then err "restore: pass a backup name, 'latest' or 'current' (stdin is not a terminal)"; return 1; fi
+      shown=$(( n > 30 ? 30 : n ))
+      printf '\nBackups at %s (newest first):\n' "$T_LOC" >&2
+      for ((i = 1; i <= shown; i++)); do printf '  %2d) %s\n' "$i" "${all[n-i]}" >&2; done
+      if (( n > shown )); then printf '      ... %d older backup(s) not shown (name one explicitly to use it)\n' $((n - shown)) >&2; fi
+      while :; do
+        read -r -p "Restore which backup? [1-$shown, q to quit]: " ans || return 1
+        if [[ $ans == [qQ] ]]; then msg "Cancelled."; return 1; fi
+        if [[ $ans =~ ^[0-9]+$ ]] && (( 10#$ans >= 1 && 10#$ans <= shown )); then break; fi
+        warn "please enter a number from 1 to $shown"
+      done
+      src=$(jp "$T_BKDIR" "${all[n-10#$ans]}") ;;
+    *)
+      if [[ $sel == */* ]]; then err "give a backup file name, not a path"; return 1; fi
+      src=$(jp "$T_BKDIR" "$sel") ;;
+  esac
+
+  p_exists "$src" || ex=$?
+  if (( ex != 0 )); then err "not found: $src"; return 1; fi
+  name=${src##*/}
+  msg "Selected: $name"
+  guard_source "$src" "the selected database" || return 1
+  confirm "Replace the PC database with this copy? (the current PC database is backed up first)" || return 1
+  if dry "restore $src -> $PC_DB (current PC database would be backed up first)"; then return 0; fi
+
+  pc_dir=$(dirname -- "$PC_DB")
+  p_mkdir "$pc_dir" || return 1
+  if [[ -f $PC_DB ]]; then
+    msg "Backing up the current PC database first"
+    make_backup "$PC_DB" "$PC_BACKUP_DIR" || return 1
+    msg "  saved as ${BACKUP_MADE##*/}"
+  fi
+  safe_copy "$src" "$PC_DB" || return 1
+  ok "PC database restored from $name: $PC_DB"
+  return 0
+}
+
+cmd_restore() {   # [LOCATION] [BACKUP|latest|current]
+  local loc=${1:-pc}
+  loc=$(norm_loc "$loc") || usage_error "restore: unknown location: $1"
+  if [[ $loc == all ]]; then usage_error "restore: pick one location"; fi
+  with_target "$loc" "Restore from $loc" _restore_inner "${2:-}"
+}
+
+_prune_inner() { prune_dir "$T_BKDIR" "$1" 1 && ok "backups at $T_LOC are within the limit"; }
+
+cmd_prune() {
+  local loc keep
+  if [[ -z ${1:-} ]]; then usage_error "prune: which location? (pc | flash | nas | gdrive)"; fi
+  loc=$(norm_loc "$1") || usage_error "prune: unknown location: $1"
+  if [[ $loc == all ]]; then usage_error "prune: pick one location"; fi
+  keep=${OPT_KEEP:-${CFG[KEEP_BACKUPS]}}
+  if ! [[ $keep =~ ^[0-9]+$ ]] || (( 10#$keep < 1 )); then
+    usage_error "prune: say how many backups to keep, for example --keep 10 (1 or more)"
+  fi
+  with_target "$loc" "Prune $loc" _prune_inner "$((10#$keep))"
+}
+
+cmd_config() {
+  local sub=${1:-show} k v problem editor
+  case $sub in
+    show)
+      for k in "${CFG_KEYS[@]}"; do printf '%s="%s"\n' "$k" "${CFG[$k]}"; done ;;
+    get)
+      k=${2:-}; if [[ -z $k ]]; then usage_error "config get: which setting?"; fi
+      k=${k^^}; if [[ -z ${DEF[$k]+x} ]]; then usage_error "unknown setting: $k"; fi
+      printf '%s\n' "${CFG[$k]}" ;;
+    set)
+      if (( $# < 3 )); then usage_error "config set: usage: config set KEY VALUE"; fi
+      k=${2^^}; v=$3
+      if [[ -z ${DEF[$k]+x} ]]; then usage_error "unknown setting: $k"; fi
+      problem=$(validate_value "$k" "$v") || die "$problem"
+      if dry "set $k=\"$v\" in $CONFIG_FILE"; then return 0; fi
+      config_set_file "$k" "$v" || die "could not write $CONFIG_FILE"
+      ok "$k saved" ;;
+    path)
+      printf '%s\n' "$CONFIG_FILE" ;;
+    edit)
+      if [[ ! -f $CONFIG_FILE ]]; then write_config_file "$CONFIG_FILE" || die "could not write $CONFIG_FILE"; fi
+      editor=${VISUAL:-${EDITOR:-vi}}
+      # shellcheck disable=SC2086
+      $editor "$CONFIG_FILE" ;;
+    *) usage_error "config: unknown action '$sub' (show | get | set | edit | path)" ;;
+  esac
+}
+
+# ---------------------------------------------------------- init (setup wizard)
+wizard_credentials() {   # offer to store the NAS login in a mode-600 file
+  local file user pw= pw2=
+  if [[ -n ${CFG[NAS_CREDENTIALS]} ]]; then
+    msg "NAS credentials file: ${CFG[NAS_CREDENTIALS]}"
+    ask_yn "Replace the stored NAS login?" n || return 0
+    file=$(local_path "${CFG[NAS_CREDENTIALS]}")
+  else
+    ask_yn "Store the NAS login in a protected file (mode 600) so mount does not ask every time?" y || return 0
+    file=$CONFIG_DIR/nas.cred
+  fi
+  user=${CFG[NAS_USER]}
+  if [[ -z $user ]]; then warn "NAS_USER is empty - answer the user name question first"; return 0; fi
+  IFS= read -r -s -p "NAS password for '$user' (hidden): " pw || return 1; echo >&2
+  IFS= read -r -s -p "Repeat the password: " pw2 || return 1; echo >&2
+  if [[ -z $pw || $pw != "$pw2" ]]; then warn "empty or different passwords - nothing stored"; return 0; fi
+  mkdir -p -- "$(dirname -- "$file")" || return 1
+  ( umask 077; printf 'username=%s\npassword=%s\n' "$user" "$pw" >"$file" ) || { err "could not write $file"; return 1; }
+  chmod 600 -- "$file" || return 1
+  CFG[NAS_CREDENTIALS]=$file
+  ok "NAS login stored in $file (mode 600)"
+}
+
+_test_nas_inner() {
+  local ex=0
+  p_exists "$T_DB" || ex=$?
+  case $ex in
+    0) ok "NAS reachable; database found: $T_DB" ;;
+    1) ok "NAS reachable; no database there yet (update-nas will create it)" ;;
+    *) warn "NAS mounted but $T_DBDIR could not be read"; return 1 ;;
+  esac
+}
+
+wizard_tests() {
+  local rc=0 remote
+  step "Testing"
+  if [[ -f $PC_DB ]]; then
+    if check_kdbx "$PC_DB"; then ok "PC database found and looks like a KDBX file: $PC_DB"
+    else warn "PC database exists but does not look like a KDBX file: $PC_DB"; fi
+  else
+    warn "PC database not found yet: $PC_DB"
+  fi
+  if p_mkdir "$PC_BACKUP_DIR" && [[ -w $PC_BACKUP_DIR || $DRY_RUN == 1 ]]; then ok "PC backup folder is writable: $PC_BACKUP_DIR"
+  else warn "PC backup folder is not writable: $PC_BACKUP_DIR"; fi
+
+  if have_tool lsblk >/dev/null; then
+    usb_scan
+    if (( ${#USB_DEV[@]} )); then ok "USB drives detected: ${#USB_DEV[@]} (you choose one when running update-flash)"
+    else warn "no USB drive plugged in right now (not an error)"; fi
+  else
+    warn "lsblk not installed - USB scan skipped"
+  fi
+
+  if [[ -z ${CFG[NAS_ADDR]} ]]; then
+    warn "NAS_ADDR empty - NAS test skipped"
+  elif have_tool mount.cifs >/dev/null && have_tool mountpoint >/dev/null; then
+    with_target nas "Test NAS connection" _test_nas_inner || warn "NAS test failed (see messages above)"
+  else
+    warn "mount.cifs / mountpoint not installed - NAS test skipped (install cifs-utils)"
+  fi
+
+  if have_tool rclone >/dev/null; then
+    remote=${CFG[GDRIVE_REMOTE]%:}
+    if rclone lsd "$remote:" >/dev/null 2>&1; then ok "Google Drive reachable through rclone remote '$remote'"
+    else warn "rclone remote '$remote' not usable yet - create/log in with: rclone config"; fi
+  else
+    warn "rclone not installed - Google Drive test skipped"
+  fi
+  return $rc
+}
+
+cmd_init() {
+  local k ans problem
+  if [[ ! -t 0 ]]; then die "init needs a terminal (or use: $PROG config set KEY VALUE)"; fi
+  step "$PROG setup"
+  msg "Press Enter to keep the value in [brackets]; type - to clear a value."
+  for k in "${CFG_KEYS[@]}"; do
+    if [[ $k == NAS_CREDENTIALS ]]; then wizard_credentials || true; continue; fi
+    read -r -p $'\n'"${DESC[$k]}"$'\n'"  $k [${CFG[$k]}]: " ans || return 1
+    if [[ -z $ans ]]; then continue; fi
+    if [[ $ans == - ]]; then ans=; fi
+    if problem=$(validate_value "$k" "$ans"); then CFG[$k]=$ans; else warn "$problem (kept the old value)"; fi
+  done
+  if dry "write $CONFIG_FILE"; then :; else
+    write_config_file "$CONFIG_FILE" || die "could not write $CONFIG_FILE"
+    ok "configuration saved to $CONFIG_FILE (mode 600)"
+  fi
+  init_db_names
+  wizard_tests
+  return 0
+}
+
+# ------------------------------------------------------------------- info etc.
+cmd_info() {
+  local k t p
+  printf '%s %s\n\n' "$PROG" "$VERSION"
+  printf 'Config file : %s%s\n' "$CONFIG_FILE" "$([[ -f $CONFIG_FILE ]] || echo '  (not created yet; run: kp-manager init)')"
+  printf 'Log file    : %s\n' "$LOG_FILE"
+  printf 'PC database : %s%s\n' "$PC_DB" "$([[ -f $PC_DB ]] || echo '  (NOT FOUND)')"
+  printf 'Next backup : %s_%s%s\n\nSettings:\n' "$DB_STEM" "$TS" "$DB_SUFFIX"
+  for k in "${CFG_KEYS[@]}"; do printf '  %-18s = %s\n' "$k" "${CFG[$k]}"; done
+  printf '\nPrograms:\n'
+  for t in sha256sum flock rclone mount.cifs mountpoint lsblk udisksctl sudo; do
+    if p=$(have_tool "$t"); then printf '  %-12s %s\n' "$t" "$p"; else printf '  %-12s missing\n' "$t"; fi
+  done
+}
+
+cmd_completion() {
+  if [[ ${1:-bash} != bash ]]; then usage_error "completion: only bash is supported"; fi
+  cat <<'EOF'
+# kp-manager bash completion - load with:  source <(kp-manager completion bash)
+_kp_manager() {
+  local cur prev cmd="" i
+  local cmds="init update-flash update-nas update-gdrive update-all backup-pc backup-flash backup-nas backup-gdrive restore list diff prune config info completion help version"
+  local opts="-h --help -V --version -n --dry-run -v --verbose -f --force -y --yes -c --config --db -d --device --usb-path --no-mount -k --keep --no-color"
+  cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD-1]}
+  for ((i = 1; i < COMP_CWORD; i++)); do
+    case ${COMP_WORDS[i]} in
+      -c|--config|--db|--usb-path|-d|--device|-k|--keep) ((i++)) ;;
+      -*) ;;
+      *) cmd=${COMP_WORDS[i]}; break ;;
+    esac
+  done
+  case $prev in
+    -c|--config|--db|--usb-path) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+    -d|--device) COMPREPLY=($(compgen -W "$(lsblk -rno PATH 2>/dev/null)" -- "$cur")); return ;;
+  esac
+  if [[ -z $cmd ]]; then
+    if [[ $cur == -* ]]; then COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+    else COMPREPLY=($(compgen -W "$cmds" -- "$cur")); fi
+    return
+  fi
+  case $cmd in
+    restore|list|prune) COMPREPLY=($(compgen -W "pc flash nas gdrive latest current" -- "$cur")) ;;
+    diff)               COMPREPLY=($(compgen -W "flash nas gdrive" -- "$cur")) ;;
+    config)             COMPREPLY=($(compgen -W "show get set edit path" -- "$cur")) ;;
+    completion)         COMPREPLY=($(compgen -W "bash" -- "$cur")) ;;
+    *)                  COMPREPLY=($(compgen -W "$opts" -- "$cur")) ;;
+  esac
+}
+complete -F _kp_manager kp-manager
+EOF
+}
+
+usage() {
+  cat <<EOF
+${C_BLD}$PROG $VERSION${C_OFF} - hardened backup and sync manager for KeePass (.kdbx) databases
+
+${C_BLD}USAGE${C_OFF}
+  $PROG [options] <command> [arguments]
+
+${C_BLD}COMMANDS${C_OFF}
+  init                       Interactive setup: default paths, NAS login (stored mode 600),
+                             then tests the connections.
+  update-flash               Pick a USB drive from a numbered list; back up its database
+                             (timestamped), then write the PC database to it.
+  update-nas                 Mount the NAS (CIFS), back up its database, write the PC database,
+                             unmount again.
+  update-gdrive              Same for Google Drive through rclone (rate-limit retries,
+                             backup-folder rotation, remote checksum check).
+  update-all                 flash, NAS and Google Drive, one after the other.
+  backup-pc                  Timestamped copy of the PC database in the PC backup folder
+                             (name: <database>_YYYYMMDD_HHMMSS.kdbx).
+  backup-flash|nas|gdrive    Timestamped copy of the database that is ON that location,
+                             inside that location's own backup folder.
+  restore [where] [name]     Roll the PC database back to a backup. 'where' is pc (default),
+                             flash, nas or gdrive. Without 'name' you pick from a numbered
+                             list; 'latest' = newest backup; 'current' = that location's live
+                             database. The current PC database is backed up first.
+  list <where>               List backups at a location.
+  diff <where>               Compare a location's database with the PC copy.
+  prune <where> --keep N     Delete all but the N newest backups at a location.
+  config [show|get|set|edit|path]   View or change single settings.
+  info                       Settings, paths and which programs are installed.
+  completion bash            Print the bash completion script.
+
+${C_BLD}OPTIONS${C_OFF}
+  -n, --dry-run     Simulate every copy, move and mount; change nothing.
+  -v, --verbose     Print every step, including each SHA-256 verification.
+  -f, --force       Bypass safety warnings (identical hashes, a database that is much
+                    smaller or newer on the target, a file that is not a KDBX database).
+  -y, --yes         Answer routine questions (not safety warnings) with yes.
+  -h, --help        This help.
+  -c, --config FILE Use another config file.     --db FILE      PC database for this run.
+  -d, --device DEV  USB partition, no menu.      --usb-path DIR Flash root, no menu/mounting.
+      --no-mount    Never mount/unmount; use what is already mounted.
+  -k, --keep N      Backups to keep (prune; overrides KEEP_BACKUPS).
+      --no-color    Plain output.   -V, --version
+
+${C_BLD}EXAMPLES${C_OFF}
+  $PROG init                      first-time setup
+  $PROG backup-pc                 safe copy of the database into the PC backup folder
+  $PROG update-flash              choose a drive, then update it
+  $PROG --dry-run update-nas      show what would happen, touch nothing
+  $PROG update-all                flash + NAS + Google Drive
+  $PROG restore                   pick a PC backup to roll back to
+  $PROG restore nas latest        newest NAS backup becomes the PC database
+
+Config: $CONFIG_FILE
+Log:    $LOG_FILE
+Manual: man $PROG
+EOF
+}
+
+# ---------------------------------------------------------------------- main
+need_arg() { if (( $# < 2 )); then usage_error "option $1 needs an argument"; fi; }
+
+ensure_config() {   # first run: wizard at a terminal, otherwise a clear error
+  if [[ -f $CONFIG_FILE ]]; then return 0; fi
+  if [[ -t 0 && -t 2 ]]; then
+    warn "No configuration found at $CONFIG_FILE - starting the setup wizard"
+    cmd_init || die "setup was not completed"
+  else
+    die "no configuration at $CONFIG_FILE; run '$PROG init' in a terminal first"
+  fi
+}
+
+main() {
+  local a i cmd loc rc=0 needs_lock=0 needs_config=1
+  local -a args=() pos=()
+
+  for a in "$@"; do          # split bundled flags such as -nv
+    if [[ $a =~ ^-[nvfy]{2,}$ ]]; then
+      for ((i = 1; i < ${#a}; i++)); do args+=("-${a:i:1}"); done
+    else
+      args+=("$a")
+    fi
+  done
+  set -- "${args[@]}"
+
+  while (( $# )); do
+    case $1 in
+      -h|--help)       setup_colors; usage; exit 0 ;;
+      -V|--version)    echo "$PROG $VERSION"; exit 0 ;;
+      -n|--dry-run)    DRY_RUN=1 ;;
+      -v|--verbose)    VERBOSE=1 ;;
+      -f|--force)      FORCE=1 ;;
+      -y|--yes)        ASSUME_YES=1 ;;
+      --no-color)      COLOR=never ;;
+      --no-mount)      NO_MOUNT=1 ;;
+      -c|--config)     need_arg "$@"; CONFIG_FILE=$2; shift ;;
+      --config=*)      CONFIG_FILE=${1#*=} ;;
+      --db)            need_arg "$@"; OPT_DB=$2; shift ;;
+      --db=*)          OPT_DB=${1#*=} ;;
+      -d|--device)     need_arg "$@"; OPT_DEVICE=$2; shift ;;
+      --device=*)      OPT_DEVICE=${1#*=} ;;
+      --usb-path)      need_arg "$@"; OPT_USB_PATH=$2; shift ;;
+      --usb-path=*)    OPT_USB_PATH=${1#*=} ;;
+      -k|--keep)       need_arg "$@"; OPT_KEEP=$2; shift ;;
+      --keep=*)        OPT_KEEP=${1#*=} ;;
+      --)              shift; pos+=("$@"); break ;;
+      -*)              setup_colors; usage_error "unknown option: $1" ;;
+      *)               pos+=("$1") ;;
+    esac
+    shift
+  done
+
+  setup_colors
+  cmd=${pos[0]:-}
+  if [[ -z $cmd ]]; then usage >&2; exit 2; fi
+  pos=("${pos[@]:1}")
+
+  case $cmd in
+    help)       usage; exit 0 ;;
+    version)    echo "$PROG $VERSION"; exit 0 ;;
+    completion) cmd_completion "${pos[@]}"; exit 0 ;;
+  esac
+
+  # which programs does this command need, and does it write?
+  case $cmd in
+    init|info|config)           needs_config=0 ;;
+  esac
+  case $cmd in
+    update-flash)               needs_for flash;  needs_lock=1 ;;
+    update-nas)                 needs_for nas;    needs_lock=1 ;;
+    update-gdrive)              needs_for gdrive; needs_lock=1 ;;
+    update-all)                 needs_for flash; needs_for nas; needs_for gdrive; needs_lock=1 ;;
+    backup-pc)                  needs_lock=1 ;;
+    backup-flash)               needs_for flash;  needs_lock=1 ;;
+    backup-nas)                 needs_for nas;    needs_lock=1 ;;
+    backup-gdrive)              needs_for gdrive; needs_lock=1 ;;
+    restore)                    needs_lock=1
+                                if loc=$(norm_loc "${pos[0]:-pc}"); then needs_for "$loc"; fi ;;
+    prune)                      needs_lock=1
+                                if loc=$(norm_loc "${pos[0]:-}"); then needs_for "$loc"; fi ;;
+    list|diff)                  if loc=$(norm_loc "${pos[0]:-}"); then needs_for "$loc"; fi ;;
+    init|info|config)           ;;
+    *)                          usage_error "unknown command: $cmd" ;;
+  esac
+
+  mkdir -p -- "$STATE_DIR"
+  trap cleanup EXIT
+  trap 'on_signal INT' INT
+  trap 'on_signal TERM' TERM
+  trap 'on_signal HUP' HUP
+  check_dependencies
+  TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kp-manager.XXXXXX")
+  if [[ -f $LOG_FILE ]] && (( $(stat -c %s -- "$LOG_FILE") > 1048576 )); then mv -f -- "$LOG_FILE" "$LOG_FILE.1"; fi
+  _log INFO "start: $PROG $cmd ${pos[*]-} (pid $$, user $(id -un), dry-run=$DRY_RUN force=$FORCE)"
+
+  if (( EUID == 0 )); then
+    warn "running as root: '~' paths point to root's home; run $PROG as your normal user (it uses sudo where needed)"
+  fi
+
+  if (( needs_config )); then ensure_config; fi
+  load_config "$CONFIG_FILE" || exit 1
+  if [[ -n $OPT_DB ]]; then CFG[DB_PATH]=$OPT_DB; fi
+  init_db_names
+
+  if (( needs_lock )); then acquire_lock; fi
+
+  case $cmd in
+    init)           cmd_init || rc=$? ;;
+    update-flash)   cmd_update flash  || rc=$? ;;
+    update-nas)     cmd_update nas    || rc=$? ;;
+    update-gdrive)  cmd_update gdrive || rc=$? ;;
+    update-all)     cmd_update flash nas gdrive || rc=$? ;;
+    backup-pc)      cmd_backup pc     || rc=$? ;;
+    backup-flash)   cmd_backup flash  || rc=$? ;;
+    backup-nas)     cmd_backup nas    || rc=$? ;;
+    backup-gdrive)  cmd_backup gdrive || rc=$? ;;
+    restore)        cmd_restore "${pos[@]}" || rc=$? ;;
+    list)           cmd_list "${pos[@]}"    || rc=$? ;;
+    diff)           cmd_diff "${pos[@]}"    || rc=$? ;;
+    prune)          cmd_prune "${pos[@]}"   || rc=$? ;;
+    config)         cmd_config "${pos[@]}"  || rc=$? ;;
+    info)           cmd_info || rc=$? ;;
+  esac
+  exit "$rc"
+}
+
+main "$@"
