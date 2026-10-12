@@ -42,3 +42,5 @@ man kp-manager
 ## Note
 
 For devices such as a phone, it is recommended to synchronize your desktop with the device using Syncthing.
+
+Also, since regular NAS is expensive, you can just set up router with OpenWRT with USB drive for extroot and set up NAS on that.
